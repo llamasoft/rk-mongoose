@@ -48,6 +48,8 @@
 #define PATH_MAX FILENAME_MAX
 #endif // __SYMBIAN32__
 
+#define NO_SSI
+
 #ifndef _WIN32_WCE // Some ANSI #includes are not available on Windows CE
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -446,7 +448,7 @@ static const char *config_options[] = {
   "S", "ssi_pattern", "**.shtml$|**.shtm$",
   "T", "throttle", NULL,
   "a", "access_log_file", NULL,
-  "d", "enable_directory_listing", "yes",
+  "d", "enable_directory_listing", "no",
   "e", "error_log_file", NULL,
   "g", "global_auth_file", NULL,
   "i", "index_files", "index.html,index.htm,index.cgi,index.shtml,index.php",
@@ -929,6 +931,7 @@ static void send_http_error(struct mg_connection *conn, int status,
 
   mg_printf(conn, "HTTP/1.1 %d %s\r\n"
             "Content-Length: %d\r\n"
+            "Content-Type: text/plain\r\n"
             "Connection: %s\r\n\r\n", status, reason, len,
             suggest_connection_header(conn));
   conn->num_bytes_sent += mg_printf(conn, "%s", buf);
@@ -1344,15 +1347,30 @@ static int mg_stat(struct mg_connection *conn, const char *path,
                    struct file *filep) {
   struct stat st;
 
-  if (!is_file_in_memory(conn, path, filep) && !stat(path, &st)) {
+  if( is_file_in_memory(conn, path, filep) )
+      return filep->membuf != NULL;
+
+  if( stat(path, &st) == 0)
+  {
     filep->size = st.st_size;
+    if( st.st_mtime == 0 )
+    {
+        // special case - mongoose makes certain assumptions if
+        // file modification time is 0, which happened to be the case
+        // in our firmware. /www files have modification time set to 0
+        // to trick mongoose set modification time to 1 second
+        filep->modification_time = 1;
+    }
+    else
     filep->modification_time = st.st_mtime;
     filep->is_directory = S_ISDIR(st.st_mode);
-  } else {
-    filep->modification_time = (time_t) 0;
+    return 1;
   }
-
-  return filep->membuf != NULL || filep->modification_time != (time_t) 0;
+  else
+  {
+    filep->modification_time = (time_t) 0;
+    return 0;
+  }
 }
 
 static void set_close_on_exec(int fd) {
@@ -3375,7 +3393,7 @@ static void put_file(struct mg_connection *conn, const char *path) {
     mg_fclose(&file);
   }
 }
-
+#if !define NO_SSI
 static void send_ssi_file(struct mg_connection *, const char *,
                           struct file *, int);
 
@@ -3528,7 +3546,7 @@ static void handle_ssi_file_request(struct mg_connection *conn,
     mg_fclose(&file);
   }
 }
-
+#endif
 static void send_options(struct mg_connection *conn) {
   conn->status_code = 200;
 
@@ -4262,10 +4280,12 @@ static void handle_request(struct mg_connection *conn) {
       handle_cgi_request(conn, path);
     }
 #endif // !NO_CGI
+#if !define NO_SSI
   } else if (match_prefix(conn->ctx->config[SSI_EXTENSIONS],
                           strlen(conn->ctx->config[SSI_EXTENSIONS]),
                           path) > 0) {
     handle_ssi_file_request(conn, path);
+#endif
   } else if (is_not_modified(conn, &file)) {
     send_http_error(conn, 304, "Not Modified", "%s", "");
   } else {
@@ -4815,6 +4835,7 @@ static void process_new_connection(struct mg_connection *conn) {
     }
     if (ri->remote_user != NULL) {
       free((void *) ri->remote_user);
+      ri->remote_user = NULL;
     }
 
     // NOTE(lsm): order is important here. should_keep_alive() call
